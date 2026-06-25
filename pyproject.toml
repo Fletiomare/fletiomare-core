@@ -1,0 +1,13 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fletiomare-core"
+version = "0.1.0"
+description = "Shared core for Fletiomare apps on top of the lisa-auth provider (provider client, base HTTP handler, base store)."
+requires-python = ">=3.11"
+dependencies = []   # stdlib-only core; apps add their own (openpyxl, Pillow, google libs, …)
+
+[tool.setuptools]
+packages = ["fletiomare_core"]

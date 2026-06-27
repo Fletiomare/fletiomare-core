@@ -53,6 +53,10 @@ class CoreConfig:
     sendgrid_api_key: str = ""
     notify_email: str = ""   # commission inbox
     from_email: str = ""
+    # Google sign-in: the OAuth Web client id (public). When set, the SPA shows a
+    # "Sign in with Google" button and the provider accepts /google-login. The
+    # provider verifies the token; this value lets the frontend render the button.
+    google_client_id: str = ""
 
 
 def core_config_kwargs_from_env() -> dict:
@@ -70,4 +74,5 @@ def core_config_kwargs_from_env() -> dict:
         sendgrid_api_key=os.environ.get("SENDGRID_API_KEY", ""),
         notify_email=os.environ.get("CONTENT_NOTIFY_EMAIL", ""),
         from_email=os.environ.get("CONTENT_FROM_EMAIL", ""),
+        google_client_id=os.environ.get("GOOGLE_CLIENT_ID", ""),
     )

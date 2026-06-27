@@ -12,11 +12,12 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Dict, Optional, Set, Tuple
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 
 from .limiter import LoginLimiter
 from .provider import call_provider
@@ -27,6 +28,10 @@ from .store import StoreError
 _admin_cache: Set[str] = set()
 _admin_cache_at = 0.0
 _ADMIN_TTL = 60.0
+
+# Cached email -> roles map from the shadow `users` table (Google sign-in).
+_roles_cache: Dict[str, Set[str]] = {}
+_roles_cache_at = 0.0
 
 _ASSET_TYPES = {
     ".js": "text/javascript; charset=utf-8",
@@ -137,8 +142,33 @@ class BaseHandler(BaseHTTPRequestHandler):
         global _admin_cache_at
         _admin_cache_at = 0.0
 
+    def _user_roles_map(self) -> Dict[str, Set[str]]:
+        """email -> roles for enabled shadow users (cached ~60s)."""
+        global _roles_cache, _roles_cache_at
+        if time.time() - _roles_cache_at >= _ADMIN_TTL:
+            try:
+                _roles_cache = {str(u.get("email")): set(u.get("roles") or [])
+                                for u in self.store.list_users()
+                                if u.get("enabled", True)}
+                _roles_cache_at = time.time()
+            except (StoreError, AttributeError):
+                pass  # keep the stale map on a transient backend error
+        return _roles_cache
+
+    def _invalidate_user_cache(self) -> None:
+        global _roles_cache_at
+        _roles_cache_at = 0.0
+
+    def _member_roles(self, member: Dict[str, Any]) -> Set[str]:
+        """Roles for a member — from the shadow `users` table by email (Google
+        sign-in). LISA members carry no email here, so they get the empty set."""
+        email = str(member.get("email") or "").strip().lower()
+        return self._user_roles_map().get(email, set()) if email else set()
+
     def _effective_admin(self, member: Dict[str, Any], provider_is_admin: Any) -> bool:
-        return bool(provider_is_admin) or bool(self._member_numbers(member) & self._admin_numbers())
+        return (bool(provider_is_admin)
+                or bool(self._member_numbers(member) & self._admin_numbers())
+                or "admin" in self._member_roles(member))
 
     def _resolve_member(self) -> Optional[Tuple[Dict[str, Any], bool]]:
         """Identify the caller via the provider's /me. Sends 401 and returns None
@@ -186,12 +216,16 @@ class BaseHandler(BaseHTTPRequestHandler):
                 return self._serve_ui()
             if path == "/health":
                 return self._send(200, {"status": "ok", "app": self.app_name})
+            if path == "/auth-config":
+                return self._auth_config()
             if path == "/me":
                 return self._me()
             if path == "/api" or path.startswith("/api/"):
                 return self._proxy("GET", self.path, with_token=True)  # full path + query
             if path == "/admins":
                 return self._list_admins()
+            if path == "/users":
+                return self._list_users()
             if self.route_get(path):
                 return
             return self._serve_static(path)
@@ -203,10 +237,14 @@ class BaseHandler(BaseHTTPRequestHandler):
             path = urlparse(self.path).path
             if path == "/login":
                 return self._login()
+            if path == "/google-login":
+                return self._google_login()
             if path == "/logout":
                 return self._proxy("POST", "/logout", with_token=True)
             if path == "/admins":
                 return self._add_admin()
+            if path == "/users":
+                return self._upsert_user()
             if self.route_post(path):
                 return
             self._send(404, {"error": "not found"})
@@ -227,6 +265,8 @@ class BaseHandler(BaseHTTPRequestHandler):
             path = urlparse(self.path).path
             if path.startswith("/admins/"):
                 return self._remove_admin(path.split("/", 2)[2])
+            if path.startswith("/users/"):
+                return self._remove_user(unquote(path.split("/", 2)[2]))
             if self.route_delete(path):
                 return
             self._send(404, {"error": "not found"})
@@ -266,13 +306,41 @@ class BaseHandler(BaseHTTPRequestHandler):
             self.limiter.reset(*keys)
             if isinstance(data, dict) and data.get("member") is not None:
                 data["is_admin"] = self._effective_admin(data["member"], data.get("is_admin"))
+                data["roles"] = sorted(self._member_roles(data["member"]))
         self._send(status, data)
+
+    def _google_login(self):
+        """Proxy a Google ID token to the provider, which verifies it (signature,
+        audience, @fletiomare.nl domain) and mints a session; then merge the
+        platform's effective admin + roles. Throttled per client IP."""
+        body = self._read_json()
+        if not isinstance(body, dict):
+            return self._send(400, {"error": "invalid JSON body"})
+        key = f"ip:{self._client_ip()}"
+        wait = self.limiter.retry_after(key)
+        if wait:
+            return self._send(429, {"error": "te veel inlogpogingen, probeer het later opnieuw"},
+                              extra_headers={"Retry-After": str(wait)})
+        status, data = call_provider(self.cfg.provider_url, "POST", "/google-login", body=body)
+        if status in (401, 403):
+            self.limiter.record_failure(key)
+        elif status == 200:
+            self.limiter.reset(key)
+            if isinstance(data, dict) and data.get("member") is not None:
+                data["is_admin"] = self._effective_admin(data["member"], data.get("is_admin"))
+                data["roles"] = sorted(self._member_roles(data["member"]))
+        self._send(status, data)
+
+    def _auth_config(self):
+        """Public — lets the SPA decide whether to render the Google button."""
+        self._send(200, {"google_client_id": self.cfg.google_client_id})
 
     def _me(self):
         token = self._member_token()
         status, data = call_provider(self.cfg.provider_url, "GET", "/me", member_token=token)
         if status == 200 and isinstance(data, dict) and data.get("member") is not None:
             data["is_admin"] = self._effective_admin(data["member"], data.get("is_admin"))
+            data["roles"] = sorted(self._member_roles(data["member"]))
         self._send(status, data)
 
     # -- user management (who is "beheer") ------------------------------------
@@ -309,6 +377,41 @@ class BaseHandler(BaseHTTPRequestHandler):
         self._invalidate_admin_cache()
         if not ok:
             return self._send(404, {"error": "not found"})
+        self._send(204)
+
+    # -- shadow users (Google sign-in identities -> roles) --------------------
+    def _list_users(self):
+        if not self._require_admin():
+            return
+        self._send(200, {"users": self.store.list_users(),
+                         "roles": ["admin", "approver", "reserveerder"]})
+
+    def _upsert_user(self):
+        resolved = self._require_admin()
+        if not resolved:
+            return
+        member, _ = resolved
+        body = self._read_json()
+        if not isinstance(body, dict):
+            return self._send(400, {"error": "invalid JSON body"})
+        email = str(body.get("email") or "").strip().lower()
+        if not re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", email):
+            return self._send(400, {"error": "voer een geldig e-mailadres in"})
+        roles = sorted({re.sub(r"[^a-z0-9_-]", "", str(r).strip().lower())
+                        for r in (body.get("roles") or [])} - {""})
+        rec = self.store.upsert_user(
+            email, name=(body.get("name") or "").strip(), roles=roles,
+            enabled=bool(body.get("enabled", True)),
+            added_by=member.get("name") or member.get("email") or "")
+        self._invalidate_user_cache()
+        self._send(201, rec)
+
+    def _remove_user(self, email: str):
+        if not self._require_admin():
+            return
+        if not self.store.remove_user(str(email).strip()):
+            return self._send(404, {"error": "not found"})
+        self._invalidate_user_cache()
         self._send(204)
 
     # -- web UI / static ------------------------------------------------------

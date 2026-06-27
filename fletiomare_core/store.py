@@ -44,11 +44,16 @@ class SqliteBase:
         return conn
 
     def _create_tables(self, conn: sqlite3.Connection) -> None:
-        """Create the shared `admins` table. Subclasses override, call super, and
-        add their own tables."""
+        """Create the shared `admins` + `users` tables. Subclasses override, call
+        super, and add their own tables."""
         conn.execute(
             """CREATE TABLE IF NOT EXISTS admins (
                 number TEXT PRIMARY KEY, name TEXT, added_by TEXT, added_at REAL
+            )""")
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS users (
+                email TEXT PRIMARY KEY, name TEXT, roles TEXT, enabled INTEGER,
+                added_by TEXT, added_at REAL
             )""")
 
     # -- admins (who is "beheer") --
@@ -70,6 +75,41 @@ class SqliteBase:
         with self._conn() as conn:
             return conn.execute("DELETE FROM admins WHERE number=?",
                                 (str(number),)).rowcount > 0
+
+    # -- shadow users (Google @fletiomare.nl identity -> roles) --
+    @staticmethod
+    def _user_row(r: sqlite3.Row) -> Dict[str, Any]:
+        return {"email": r["email"], "name": r["name"],
+                "roles": json.loads(r["roles"]) if r["roles"] else [],
+                "enabled": bool(r["enabled"]), "added_by": r["added_by"],
+                "added_at": r["added_at"]}
+
+    def list_users(self) -> List[Dict[str, Any]]:
+        with self._conn() as conn:
+            rows = conn.execute("SELECT * FROM users ORDER BY added_at ASC").fetchall()
+        return [self._user_row(r) for r in rows]
+
+    def get_user(self, email: str) -> Optional[Dict[str, Any]]:
+        with self._conn() as conn:
+            r = conn.execute("SELECT * FROM users WHERE email=?",
+                             (str(email).strip().lower(),)).fetchone()
+        return self._user_row(r) if r else None
+
+    def upsert_user(self, email: str, *, name: str = "", roles: Optional[List[str]] = None,
+                    enabled: bool = True, added_by: str = "") -> Dict[str, Any]:
+        rec = {"email": str(email).strip().lower(), "name": name,
+               "roles": list(roles or []), "enabled": bool(enabled),
+               "added_by": added_by, "added_at": time.time()}
+        with self._conn() as conn:
+            conn.execute("INSERT OR REPLACE INTO users VALUES (?,?,?,?,?,?)",
+                         (rec["email"], name, json.dumps(rec["roles"]),
+                          1 if enabled else 0, added_by, rec["added_at"]))
+        return rec
+
+    def remove_user(self, email: str) -> bool:
+        with self._conn() as conn:
+            return conn.execute("DELETE FROM users WHERE email=?",
+                                (str(email).strip().lower(),)).rowcount > 0
 
 
 # --------------------------------------------------------------------------- #
@@ -210,4 +250,26 @@ class FirestoreBase:
         if not self._get("admins", str(number)):
             return False
         self._delete("admins", str(number))
+        return True
+
+    # -- shadow users (Google @fletiomare.nl identity -> roles) --
+    def list_users(self) -> List[Dict[str, Any]]:
+        return sorted(self._list("users"), key=lambda u: u.get("added_at", 0))
+
+    def get_user(self, email: str) -> Optional[Dict[str, Any]]:
+        return self._get("users", str(email).strip().lower())
+
+    def upsert_user(self, email: str, *, name: str = "", roles: Optional[List[str]] = None,
+                    enabled: bool = True, added_by: str = "") -> Dict[str, Any]:
+        rec = {"email": str(email).strip().lower(), "name": name,
+               "roles": list(roles or []), "enabled": bool(enabled),
+               "added_by": added_by, "added_at": time.time()}
+        self._put("users", rec["email"], rec)
+        return rec
+
+    def remove_user(self, email: str) -> bool:
+        e = str(email).strip().lower()
+        if not self._get("users", e):
+            return False
+        self._delete("users", e)
         return True

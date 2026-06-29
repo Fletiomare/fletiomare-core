@@ -57,6 +57,9 @@ class CoreConfig:
     # "Sign in with Google" button and the provider accepts /google-login. The
     # provider verifies the token; this value lets the frontend render the button.
     google_client_id: str = ""
+    # Workspace domain hint — the button's account chooser is limited to this domain
+    # (so personal Gmail accounts aren't offered). Enforced server-side too.
+    google_allowed_domain: str = "fletiomare.nl"
 
 
 def core_config_kwargs_from_env() -> dict:
@@ -75,4 +78,5 @@ def core_config_kwargs_from_env() -> dict:
         notify_email=os.environ.get("CONTENT_NOTIFY_EMAIL", ""),
         from_email=os.environ.get("CONTENT_FROM_EMAIL", ""),
         google_client_id=os.environ.get("GOOGLE_CLIENT_ID", ""),
+        google_allowed_domain=os.environ.get("GOOGLE_ALLOWED_DOMAIN", "fletiomare.nl"),
     )

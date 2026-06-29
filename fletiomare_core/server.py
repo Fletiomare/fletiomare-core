@@ -333,7 +333,8 @@ class BaseHandler(BaseHTTPRequestHandler):
 
     def _auth_config(self):
         """Public — lets the SPA decide whether to render the Google button."""
-        self._send(200, {"google_client_id": self.cfg.google_client_id})
+        self._send(200, {"google_client_id": self.cfg.google_client_id,
+                         "google_allowed_domain": self.cfg.google_allowed_domain})
 
     def _me(self):
         token = self._member_token()
